@@ -396,7 +396,9 @@ static RootVersionAction steadyRootVersionAction(BOOL versionValid,BOOL pending,
 // They are model strings, not the user-editable Bluetooth device name, so a
 // renamed pair still matches. Compare tolerantly: trim, ignore case, and accept
 // later model suffixes such as "AirPods Pro 3", while still telling the earbud
-// and the case apart.
+// and the case apart. Newer cases (AirPods Pro 2 with USB-C) report a 29-byte
+// name that does not start with "AirPods", taken to be "MagSafe Charging
+// Case (USB-C)", so a MagSafe charging case is accepted too.
 static NSString *foldedModelName(NSString *name) {
     NSMutableCharacterSet *trim=NSMutableCharacterSet.whitespaceAndNewlineCharacterSet;[trim formUnionWithCharacterSet:NSCharacterSet.controlCharacterSet];
     return [[name stringByTrimmingCharactersInSet:trim] lowercaseString];
@@ -407,7 +409,7 @@ static BOOL earbudModelMatches(NSString *name) {
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    return ([folded hasPrefix:@"airpods"] || [folded hasPrefix:@"magsafe"]) && [folded containsString:@"charging case"];
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -558,6 +560,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     }
     if(type==4 && self.rootModelSent && !self.rootVerified) {
         self.rootIdentity=modelName([message subdataWithRange:NSMakeRange(6,n)])?:@"Invalid model response";
+        printf("EARBUD MODEL \"%s\"\n",self.rootIdentity.UTF8String);
         if(!earbudModelMatches(self.rootIdentity)) {[self fail:HelperExitWrongEarbudModel reason:@"exact root earbud model check failed"];return;}self.rootVerified=YES;return;
     }
     if(type!=0x1b) return;if(n<8) {[self fail:HelperExitUnexpectedReply reason:@"short downstream envelope"];return;}if(be16(b+6)!=1) return;
@@ -601,6 +604,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     } else if(it==4 && self.caseModelSent && !self.caseModelVerified) {
         if((![self.pending isEqual:@"model"] || self.modelSentAfterVersionFrames!=self.caseVersionFrames)) {[self fail:HelperExitUnexpectedReply reason:@"case identity reply did not match the ordered setup query"];return;}
         self.caseIdentity=modelName(body);
+        printf("CASE MODEL \"%s\"\n",self.caseIdentity.UTF8String?:"(unreadable)");
         if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
         self.caseModelVerified=YES;self.pending=nil;self.unconfirmedBytes=self.unconfirmedBytes>=10?self.unconfirmedBytes-10:0;
         self.caseRouteDrained=self.caseVersionReplies==self.caseVersionFrames;
@@ -1067,10 +1071,10 @@ static void hardeningChecks(void) {
     check(sessionExitCode(HelperExitSignaled,nil,0,NO)==HelperExitSignaled && sessionExitCode(0,@"x",0,NO)==HelperExitUnexpectedReply,@"signals report SIGNALED; an uncoded error still exits nonzero");
 
     // Firmware ModelName matching: tolerant, but still tells the earbud from the case.
-    check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
+    check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 2") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
     check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
-    check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
-    check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
+    check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case") && chargingCaseModelMatches(@"MagSafe Charging Case (USB-C)") && chargingCaseModelMatches(@"MagSafe Charging Case"),@"case ModelName match ignores case and padding, and accepts the MagSafe case of AirPods Pro 2");
+    check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(@"MagSafe Charger") && !earbudModelMatches(@"MagSafe Charging Case (USB-C)") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
     check(root.rootVerified && !root.error,@"root identity accepts a later AirPods Pro ModelName");

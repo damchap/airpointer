@@ -59,7 +59,7 @@ final class TapClickSound {
     // A running engine starts a sound at once, where AVAudioPlayer holds its caller about 30 ms every time. Its queue keeps
     // Core Audio off the pointer's main run loop. It only ever uses the output: touching its input would open a microphone.
     private let engine=AVAudioEngine(),node=AVAudioPlayerNode(),queue=DispatchQueue(label:"airpointer.click-sound",qos:.userInteractive)
-    private let buffer:AVAudioPCMBuffer?
+    private var buffer:AVAudioPCMBuffer?
     var loaded:Bool{buffer != nil}
     private init(){
         buffer=Bundle.main.url(forResource:"TapClick",withExtension:"wav").flatMap{url in
@@ -68,12 +68,18 @@ final class TapClickSound {
                   (try? file.read(into:buffer)) != nil else{return nil}
             return buffer
         }
-        if let buffer{engine.attach(node);engine.connect(node,to:engine.mainMixerNode,format:buffer.format)}
+        if let buffer{
+            engine.attach(node)
+            // macOS 27 replaced the silent connect with one that reports failure; without a link there is no click.
+            if #available(macOS 27,*){if (try? engine.connectNode(node,to:engine.mainMixerNode,format:buffer.format)) == nil{engine.detach(node);self.buffer=nil}}
+            else{engine.connect(node,to:engine.mainMixerNode,format:buffer.format)}
+        }
     }
     // A change of output stops the engine, so anything that needs it brings it back.
     private func run(){
         guard buffer != nil,!engine.isRunning else{return}
-        if (try? engine.start()) != nil{node.play()}
+        guard (try? engine.start()) != nil else{return}
+        if #available(macOS 27,*){try? node.playAudio()}else{node.play()}
     }
     func start(){queue.async{self.run()}}
     func stop(){queue.async{self.node.stop();self.engine.stop()}}
@@ -288,6 +294,7 @@ func runClosedCaseNativeChecks() throws {
     guard closedCaseLidOpen(frame(0x24,0x11),productID:0x2027)==true,closedCaseLidOpen(frame(0x62,0x32),productID:0x2027)==true,
           closedCaseLidOpen(frame(0x24,0x19),productID:0x2027)==false,closedCaseLidOpen(frame(0x02,0x11),productID:0x2027)==nil,
           closedCaseLidOpen(frame(0x24,0x11,model:[0x14,0x20]),productID:0x2027)==nil,closedCaseLidOpen(frame(0x24,0x11,model:[0x14,0x20]),productID:0x2014)==true,
+          closedCaseLidOpen(frame(0x24,0x19,model:[0x24,0x20]),productID:0x2024)==false,closedCaseLidOpen(frame(0x24,0x11,model:[0x24,0x20]),productID:0x2014)==nil,
           closedCaseLidOpen(frame(0x24,0x11,length:27),productID:0x2027)==nil else{
         throw LessonError.message("The lid broadcast must be read only for this model with an earbud in the case.")
     }

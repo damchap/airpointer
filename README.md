@@ -29,7 +29,8 @@
 | Item | Status |
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
-| AirPods Pro 2 | Recognized, not tested |
+| macOS 27 | Builds with no warnings and passes the offline checks; not tested with AirPods |
+| AirPods Pro 2 (Lightning and USB-C) | Recognized, not tested |
 | AirPods paired with your Mac | Required |
 | Xcode | Required to build |
 

@@ -24,12 +24,15 @@ struct PointerSettingsState:Equatable {
     var pair=0
     var speed=1.0
     var clickSound=true
+    // Three taps pick up, the next tap drops.
+    var dragLock=true
     // The way this person's taps push the sensor, when setup learned one other than the usual.
     var tapDirection:[Double]?=nil
 
     // Slider legacy: 10…60 stored as pointerSensitivity; speed is that value / 25.
     private static let sensitivityKey="pointerSensitivity"
     private static let clickSoundKey="tapClickSound"
+    private static let dragLockKey="tapDragLock"
     private static let tapDirectionKey="tapDirection"
     private static let screenKey="pointerScreen"
     private static let screenIDKey="pointerScreenID"
@@ -45,6 +48,7 @@ struct PointerSettingsState:Equatable {
             value.speed=min(60,max(10,saved))/25
         }
         value.clickSound=UserDefaults.standard.object(forKey:clickSoundKey) as? Bool ?? true
+        value.dragLock=UserDefaults.standard.object(forKey:dragLockKey) as? Bool ?? true
         value.tapDirection=(UserDefaults.standard.array(forKey:tapDirectionKey) as? [Double]).flatMap{$0.count==3 ? $0:nil}
         if let saved=UserDefaults.standard.object(forKey:screenKey) as? Int{value.screen=max(0,saved)}
         value.screenID=UserDefaults.standard.string(forKey:screenIDKey)
@@ -56,6 +60,7 @@ struct PointerSettingsState:Equatable {
     func persist(){
         UserDefaults.standard.set(min(60,max(10,speed*25)),forKey:Self.sensitivityKey)
         UserDefaults.standard.set(clickSound,forKey:Self.clickSoundKey)
+        UserDefaults.standard.set(dragLock,forKey:Self.dragLockKey)
         if let tapDirection{UserDefaults.standard.set(tapDirection,forKey:Self.tapDirectionKey)}else{UserDefaults.standard.removeObject(forKey:Self.tapDirectionKey)}
         UserDefaults.standard.set(screen,forKey:Self.screenKey)
         if let screenID{UserDefaults.standard.set(screenID,forKey:Self.screenIDKey)}else{UserDefaults.standard.removeObject(forKey:Self.screenIDKey)}
@@ -64,22 +69,23 @@ struct PointerSettingsState:Equatable {
 
 func runPointerSettingsChecks()throws {
     let defaults=UserDefaults.standard
-    let keys=["pointerSensitivity","tapClickSound","pointerScreen","pointerScreenID","tapDirection"]
+    let keys=["pointerSensitivity","tapClickSound","tapDragLock","pointerScreen","pointerScreenID","tapDirection"]
     let prior=Dictionary(uniqueKeysWithValues:keys.map{($0,defaults.object(forKey:$0))})
     defer{for key in keys{if let value=prior[key]{defaults.set(value,forKey:key)}else{defaults.removeObject(forKey:key)}}}
     defaults.removeObject(forKey:"pointerSensitivity")
     defaults.removeObject(forKey:"tapClickSound")
+    defaults.removeObject(forKey:"tapDragLock")
     defaults.removeObject(forKey:"pointerScreen")
     defaults.removeObject(forKey:"pointerScreenID")
     defaults.removeObject(forKey:"tapDirection")
     let fresh=PointerSettingsState.loadPersisted()
-    guard fresh.speed==1,fresh.clickSound,fresh.screen==0,fresh.screenID==nil,fresh.tapDirection==nil else{
-        throw LessonError.message("Default pointer settings should be speed 1, click sound on, screen 0.")
+    guard fresh.speed==1,fresh.clickSound,fresh.dragLock,fresh.screen==0,fresh.screenID==nil,fresh.tapDirection==nil else{
+        throw LessonError.message("Default pointer settings should be speed 1, click sound and drag lock on, screen 0.")
     }
-    var sample=PointerSettingsState(screen:1,screenID:"side",speed:1.4,clickSound:false,tapDirection:[0.6,0,-0.8])
+    var sample=PointerSettingsState(screen:1,screenID:"side",speed:1.4,clickSound:false,dragLock:false,tapDirection:[0.6,0,-0.8])
     sample.clampSpeed();sample.persist()
     let loaded=PointerSettingsState.loadPersisted()
-    guard abs(loaded.speed-1.4)<1e-9,!loaded.clickSound,loaded.screen==1,loaded.screenID=="side",loaded.tapDirection==[0.6,0,-0.8] else{
+    guard abs(loaded.speed-1.4)<1e-9,!loaded.clickSound,!loaded.dragLock,loaded.screen==1,loaded.screenID=="side",loaded.tapDirection==[0.6,0,-0.8] else{
         throw LessonError.message("Pointer settings did not round-trip through UserDefaults.")
     }
     // The chosen display wherever it now sits; with it unplugged, a display that exists; with no choice, the same place.
@@ -515,6 +521,7 @@ private final class SettingsPage:NSObject {
     private let pairs=NSPopUpButton()
     private let speed=NSSlider(value:1,minValue:0.4,maxValue:2.4,target:nil,action:nil)
     private let clickSound=InkSwitch()
+    private let dragLock=InkSwitch()
     private let shortcutControl=PointerShortcutControl()
     private let speedValue=rkLabel("1.0×",13,.medium)
 
@@ -548,6 +555,8 @@ private final class SettingsPage:NSObject {
         column.addHeader("Tap to click")
         clickSound.setAccessibilityLabel("Click sound");clickSound.onChange={[weak self] _ in self?.changed(nil)}
         column.addFull(hmSettingRow("Click sound","Plays on this Mac when a tap on the case clicks.",clickSound))
+        dragLock.setAccessibilityLabel("Drag lock");dragLock.onChange={[weak self] _ in self?.changed(nil)}
+        column.addFull(hmSettingRow("Drag lock","Tap three times to pick something up, move the case to drag it, then tap once to drop it. A double-click waits a moment for a third tap.",dragLock))
         let teachTap=RemoteButton("Teach Tap…",style:.secondary,height:32,target:self,action:#selector(teachTap))
         column.addFull(hmSettingRow("Your tap","Tap the case three times so AirPointer knows how your taps feel.",teachTap))
         column.addHeader("Calibration")
@@ -573,10 +582,11 @@ private final class SettingsPage:NSObject {
         rkSetText(speedValue,String(format:"%.1f×",state.speed))
         speed.setAccessibilityValueDescription(String(format:"%.1f times normal speed",state.speed))
         clickSound.setOn(state.clickSound,animated:false)
+        dragLock.setOn(state.dragLock,animated:false)
     }
     @objc private func changed(_ sender:Any?) {
         var value=home.pointerSettings
-        value.screen=max(0,screens.indexOfSelectedItem);value.speed=(speed.doubleValue*10).rounded()/10;value.clickSound=clickSound.isOn
+        value.screen=max(0,screens.indexOfSelectedItem);value.speed=(speed.doubleValue*10).rounded()/10;value.clickSound=clickSound.isOn;value.dragLock=dragLock.isOn
         if !value.pairs.isEmpty{value.pair=pairs.indexOfSelectedItem-(value.pair<0 ? 1:0)}
         home.changePointerSettings(value)
     }

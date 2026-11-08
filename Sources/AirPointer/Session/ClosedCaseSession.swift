@@ -538,7 +538,7 @@ final class ClosedCaseSession: NSObject {
     private var pointerFilter=ClosedCasePointerFilter()
     private var readStats=(count:0,total:0.0,longest:0.0,since:0.0)
     private var tapDetector=ClosedCaseTapDetector(),recentPoints:[(t:Double,point:CGPoint)]=[],tapHold:CGPoint?
-    private var lastClick:(uptime:Double,position:CGPoint,count:Int64)?
+    private var dragLock=ClosedCaseDragLock()
     private var closedAt=0.0,startedAt=0.0,helperStartedAt=0.0,stoppedAt=0.0,busyRetries=0
     private var activity:NSObjectProtocol?
     private var savedMeasure=0,lastCalibrationSave=0.0
@@ -556,6 +556,7 @@ final class ClosedCaseSession: NSObject {
     private let bluetooth=ClosedCaseBluetoothAccess()
     private var resumeAfterDrop=false
     var speed=1.0,clickSound=true
+    var dragLockOn:Bool{get{dragLock.enabled}set{dragLock.enabled=newValue}}
     var pointsWhenReady=false,usesNotch=false
     var centersItself:Bool{pointsWhenReady && centerOnly}
     var preparingConnection:Bool{preparing && lidWatcher==nil}
@@ -609,7 +610,8 @@ final class ClosedCaseSession: NSObject {
     func resumeCursor(){toggleCursor()}
     func recenter(){if calibrated && inputReady{let resume=enabled;setPose();if resume{toggleCursor()}}else{changed()}}
     func recalibrate(){pause();hasPointed=false;calibrated=false;motion?.resetGrip();changed()}
-    func pause(_ reason:String="Paused"){pauseReason=reason;enabled=false;resumeAfterDrop=false;changed()}
+    // Every way the pointer stops comes through here, so a held drag is always let go.
+    func pause(_ reason:String="Paused"){releaseDrag();pauseReason=reason;enabled=false;resumeAfterDrop=false;changed()}
     func disconnect(then done:(()->Void)?=nil){
         if let done{if isActive{afterEnd.append(done)}else{done();return}}
         userEnded=true;stop()
@@ -778,6 +780,7 @@ final class ClosedCaseSession: NSObject {
         if stopping && stoppedAt>0 && now-stoppedAt>3{if !signalled{signalled=true;helper?.terminate()};return}
         if now-lastStatus>0.2{lastStatus=now;readStatus()}
         if !stopping && helper?.isRunning == true{readMotion()}
+        if enabled{perform(dragLock.tick(now:now))}
         if enabled && closedCaseShouldPause(motionAge:now-lastHost){
             pause("Lost the case’s motion. Pointing resumes when it’s back.");resumeAfterDrop=true
         }
@@ -850,7 +853,7 @@ final class ClosedCaseSession: NSObject {
                     let at=recentPoints.last{$0.t<since}?.point ?? smooth;tapHold=at
                     if enabled{
                         let decided=ProcessInfo.processInfo.systemUptime
-                        if let tapTest{tapTest(.click)}else{postClick(at)}
+                        if let tapTest{tapTest(.click)}else{handleTap(at)}
                         let clicked=ProcessInfo.processInfo.systemUptime
                         if clickSound{TapClickSound.shared.play()}
                         let sounded=ProcessInfo.processInfo.systemUptime
@@ -940,17 +943,36 @@ final class ClosedCaseSession: NSObject {
     }
     private func postCursor(){
         guard let bounds=pointerBounds(),
-              let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(smooth,bounds:bounds),mouseButton:.left) else{pause();return}
+              let event=CGEvent(mouseEventSource:nil,mouseType:dragLock.dragging ? .leftMouseDragged:.mouseMoved,mouseCursorPosition:screenPoint(smooth,bounds:bounds),mouseButton:.left) else{pause();return}
         event.post(tap:.cghidEventTap)
     }
-    private func postClick(_ point:CGPoint){
+    private func handleTap(_ point:CGPoint){
         guard let bounds=pointerBounds() else{pause();return}
-        let position=screenPoint(point,bounds:bounds),now=ProcessInfo.processInfo.systemUptime
-        let count=lastClick.map{now-$0.uptime<NSEvent.doubleClickInterval && hypot($0.position.x-position.x,$0.position.y-position.y)<8 ? $0.count+1:1} ?? 1
-        guard let down=CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:position,mouseButton:.left),
-              let up=CGEvent(mouseEventSource:nil,mouseType:.leftMouseUp,mouseCursorPosition:position,mouseButton:.left) else{return}
-        down.setIntegerValueField(.mouseEventClickState,value:count);up.setIntegerValueField(.mouseEventClickState,value:count)
-        down.post(tap:.cghidEventTap);up.post(tap:.cghidEventTap);lastClick=(now,position,count)
+        perform(dragLock.tap(at:screenPoint(point,bounds:bounds),now:ProcessInfo.processInfo.systemUptime,interval:NSEvent.doubleClickInterval))
+    }
+    private func perform(_ actions:[ClosedCaseDragLock.Action]){
+        for action in actions{
+            switch action {
+            case .click(let position,let count):
+                postButton(.leftMouseDown,at:position,count:count);postButton(.leftMouseUp,at:position,count:count)
+            case .grab(let position):
+                postButton(.leftMouseDown,at:position,count:1)
+                try? log?.write(contentsOf:Data(String(format:"drag: picked up at %.0f,%.0f\n",position.x,position.y).utf8))
+            case .drop(let position):
+                postButton(.leftMouseUp,at:position,count:1)
+                try? log?.write(contentsOf:Data(String(format:"drag: dropped at %.0f,%.0f\n",position.x,position.y).utf8))
+            }
+        }
+    }
+    private func postButton(_ type:CGEventType,at position:CGPoint,count:Int64){
+        guard let event=CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:position,mouseButton:.left) else{return}
+        event.setIntegerValueField(.mouseEventClickState,value:count);event.post(tap:.cghidEventTap)
+    }
+    // Lets go of a held drag where the cursor is now, so the button is never left down.
+    private func releaseDrag(){
+        guard dragLock.cancel(),let position=CGEvent(source:nil)?.location else{return}
+        postButton(.leftMouseUp,at:position,count:1)
+        try? log?.write(contentsOf:Data("drag: let go because the pointer stopped\n".utf8))
     }
     func stop(){
         silentOutput?.stop();silentOutput=nil;TapClickSound.shared.stop()

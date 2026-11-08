@@ -150,7 +150,7 @@ extension App {
         }
     }
     private func applyPointerSettings(_ value:PointerSettingsState,to session:ClosedCaseSession){
-        session.speed=value.speed;session.clickSound=value.clickSound;session.tapDirection=value.tapDirection
+        session.speed=value.speed;session.clickSound=value.clickSound;session.dragLockOn=value.dragLock;session.tapDirection=value.tapDirection
         session.screenIndex=value.screen
     }
     func applyHomePointerSettings(_ value:PointerSettingsState){
@@ -163,6 +163,7 @@ extension App {
         let screenChanged=pointerSettings.screen != next.screen
         pointerSettings.speed=next.speed
         pointerSettings.clickSound=next.clickSound
+        pointerSettings.dragLock=next.dragLock
         if screenChanged,NSScreen.screens.indices.contains(next.screen){pointerSettings.screen=next.screen;pointerSettings.screenID=NSScreen.screens[next.screen].displayID}
         pointerSettings.persist()
         if screenChanged{pause()}

@@ -78,6 +78,19 @@ The first time you open the app, setup has four steps.
 Press **fn ⌃** in any app to connect. Press it again to pause or resume. To use a
 different shortcut, go to Settings.
 
+### Present slides
+
+When Keynote or PowerPoint is playing a slideshow in front, taps change slides
+instead of clicking:
+
+| Tap | Slide |
+|---|---|
+| Once | Next. It changes after 0.4 s, in case a second tap follows. |
+| Twice quickly | Previous |
+
+The cursor keeps moving over the slides, so you can still point at them. There is
+nothing to turn on. In any other window, a tap clicks.
+
 <p align="center">
   <img src="Assets/Readme/screens.png" width="100%" alt="The AirPointer window, the menu bar panel, and the notch while pointing">
 </p>

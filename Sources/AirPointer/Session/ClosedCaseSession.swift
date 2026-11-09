@@ -528,6 +528,8 @@ final class ClosedCaseSession: NSObject {
     private var readStats=(count:0,total:0.0,longest:0.0,since:0.0)
     private var tapDetector=ClosedCaseTapDetector(),recentPoints:[(t:Double,point:CGPoint)]=[],tapHold:CGPoint?
     private var lastClick:(uptime:Double,position:CGPoint,count:Int64)?
+    // In a slideshow a tap waits briefly for a second one (SlideControl.swift).
+    private var slideGate=SlideTapGate()
     private var closedAt=0.0,startedAt=0.0,helperStartedAt=0.0,stoppedAt=0.0,busyRetries=0
     private var activity:NSObjectProtocol?
     private var savedMeasure=0,lastCalibrationSave=0.0
@@ -598,7 +600,7 @@ final class ClosedCaseSession: NSObject {
     func resumeCursor(){toggleCursor()}
     func recenter(){if calibrated && inputReady{let resume=enabled;setPose();if resume{toggleCursor()}}else{changed()}}
     func recalibrate(){pause();hasPointed=false;calibrated=false;motion?.resetGrip();changed()}
-    func pause(_ reason:String="Paused"){pauseReason=reason;enabled=false;resumeAfterDrop=false;changed()}
+    func pause(_ reason:String="Paused"){pauseReason=reason;enabled=false;resumeAfterDrop=false;slideGate.cancel();changed()}
     func disconnect(then done:(()->Void)?=nil){
         if let done{if isActive{afterEnd.append(done)}else{done();return}}
         userEnded=true;stop()
@@ -831,13 +833,19 @@ final class ClosedCaseSession: NSObject {
             }
             for note in tapDetector.ignored{try? log?.write(contentsOf:Data("tap: \(note)\n".utf8));tapTest?(.rejected(note))}
             tapDetector.ignored=[]
+            // A lone slideshow tap whose wait for a second one is over moves to the next slide.
+            if let key=slideGate.poll(at:ProcessInfo.processInfo.systemUptime),enabled{postSlide(key)}
             // Ahead of the orientation code, which can take tens of milliseconds now and then.
             for event in tapEvents{
                 switch event {
                 case .release:tapHold=nil
                 case .tap(let since,let jolt,let repeated):
                     let at=recentPoints.last{$0.t<since}?.point ?? smooth;tapHold=at
-                    if enabled{
+                    if enabled,tapTest==nil,SlideShow.frontmostIsShowing(){
+                        if let key=slideGate.tap(at:ProcessInfo.processInfo.systemUptime){postSlide(key)}
+                        if clickSound{TapClickSound.shared.play()}
+                        try? log?.write(contentsOf:Data(String(format:"tap: slideshow tap at %.2f, jolt %.2f g%@\n",since,jolt,repeated ? ", repeat":"").utf8))
+                    }else if enabled{
                         let decided=ProcessInfo.processInfo.systemUptime
                         if let tapTest{tapTest(.click)}else{postClick(at)}
                         let clicked=ProcessInfo.processInfo.systemUptime
@@ -931,6 +939,11 @@ final class ClosedCaseSession: NSObject {
         guard let bounds=pointerBounds(),
               let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(smooth,bounds:bounds),mouseButton:.left) else{pause();return}
         event.post(tap:.cghidEventTap)
+    }
+    private func postSlide(_ key:SlideKey){
+        guard AXIsProcessTrusted() else{pause();return}
+        SlideShow.post(key)
+        try? log?.write(contentsOf:Data("tap: \(key == .next ? "next":"previous") slide\n".utf8))
     }
     private func postClick(_ point:CGPoint){
         guard let bounds=pointerBounds() else{pause();return}

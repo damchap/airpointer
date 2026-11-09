@@ -37,6 +37,11 @@ struct ClosedCaseDragLock {
         waiting=nil;last=(held.t,held.at,2)
         return [.click(held.at,count:2)]
     }
+    // Another kind of click, such as a right-click, ends the series: a held double-click goes out first.
+    mutating func interrupt()->[Action]{
+        defer{waiting=nil;last=nil}
+        return waiting.map{[.click($0.at,count:2)]} ?? []
+    }
     // Pausing or ending forgets a held double-click and lets go of a drag. True when a drag was let go.
     mutating func cancel()->Bool{
         let was=dragging
@@ -74,4 +79,8 @@ func runDragLockChecks()throws {
     guard lock.cancel(),!lock.dragging,!lock.cancel() else{throw fail("a pause must let go of a drag once")}
     _=lock.tap(at:a,now:5,interval:0.5);_=lock.tap(at:a,now:5.2,interval:0.5)
     guard !lock.cancel(),lock.tick(now:9)==[] else{throw fail("a pause must forget a held double-click")}
+    lock=ClosedCaseDragLock()
+    _=lock.tap(at:a,now:0,interval:0.5);_=lock.tap(at:a,now:0.2,interval:0.5)
+    guard lock.interrupt()==[.click(a,count:2)],lock.tick(now:1)==[],lock.interrupt()==[],
+          lock.tap(at:a,now:0.5,interval:0.5)==[.click(a,count:1)] else{throw fail("a right-click must send a held double-click first and start a new series")}
 }

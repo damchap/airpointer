@@ -136,4 +136,12 @@ export class Grip {
   const x=(dot(v,r)*uu-dot(v,u)*ru)/d,y=(dot(v,u)*rr-dot(v,r)*ru)/d;
   return [.5+x/2,.5-y/2];
  }
+ // Twist about the pointing axis (the axis square to both aim edges, which aiming alone never turns about)
+ // and the aim that's left over, both in degrees, for twist-to-scroll: [twist, swing x, swing y, swing z].
+ twist(q){
+  if(!this.center||!this.right||!this.up)return null;
+  const axis=cross(this.right,this.up),n=norm(axis);if(n<1e-9)return null;
+  const a=axis.map(x=>x/n),v=this.relative(q),t=dot(v,a),d=180/Math.PI;
+  return [t*d,...v.map((x,i)=>(x-t*a[i])*d)];
+ }
 }

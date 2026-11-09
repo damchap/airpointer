@@ -194,7 +194,7 @@ final class ClosedCaseMotion {
         for(const row of rawRows)rawFusion.feed(row);
         ({ready:rawFusion.ready,generation:rawFusion.generation,measured:rawFusion.measured,
           gyro:rawFusion.last[12] || {},accel:rawFusion.last[11] || {},g:rawFusion.accel&&rawFusion.accel.vector,
-          point:rawGrip.point(rawFusion.q),q:rawFusion.q,edges:rawGrip.edges!==null})
+          point:rawGrip.point(rawFusion.q),twist:rawGrip.twist(rawFusion.q),q:rawFusion.q,edges:rawGrip.edges!==null})
         """)?.toDictionary() as? [String:Any]
     }
 }
@@ -489,7 +489,10 @@ final class ClosedCaseSession: NSObject {
     private var tapLearner:ClosedCaseTapLearner?,onTapLearning:((ClosedCaseTapLearner.Event)->Void)?
     func learnTaps(_ handler:@escaping(ClosedCaseTapLearner.Event)->Void){tapLearner=ClosedCaseTapLearner();onTapLearning=handler}
     func stopLearningTaps(){tapLearner=nil;onTapLearning=nil}
-    var tapDirection:[Double]?{didSet{tapDetector.direction=tapDirection.flatMap{$0.count==3 ? SIMD3($0[0],$0[1],$0[2]):nil} ?? ClosedCaseTapDetector.tapDirection}}
+    var tapDirection:[Double]?{didSet{
+        tapDetector.direction=tapDirection.flatMap{$0.count==3 ? SIMD3($0[0],$0[1],$0[2]):nil} ?? ClosedCaseTapDetector.tapDirection
+        backTapDetector.direction = -tapDetector.direction
+    }}
     var onEnded:((String?)->Void)?
     var opensLidFirst=false
     private(set) var lostContact=false
@@ -539,6 +542,12 @@ final class ClosedCaseSession: NSObject {
     private var readStats=(count:0,total:0.0,longest:0.0,since:0.0)
     private var tapDetector=ClosedCaseTapDetector(),recentPoints:[(t:Double,point:CGPoint)]=[],tapHold:CGPoint?
     private var dragLock=ClosedCaseDragLock()
+    // A tap on the back pushes the sensor the opposite way and right-clicks. The case rocks back after any tap,
+    // so a tap from the other side within echoGap of an accepted one is ignored. (After musubipapi/airpointer#12.)
+    private var backTapDetector:ClosedCaseTapDetector={var d=ClosedCaseTapDetector();d.direction = -ClosedCaseTapDetector.tapDirection;return d}()
+    private var lastAcceptedTap:(t:Double,back:Bool)?,heldByBack=false
+    private static let echoGap=0.35
+    private var twistScroll=ClosedCaseTwistScroll(),scrollHold:CGPoint?,scrollCarry=0.0,lastScrollTick=0.0
     private var closedAt=0.0,startedAt=0.0,helperStartedAt=0.0,stoppedAt=0.0,busyRetries=0
     private var activity:NSObjectProtocol?
     private var savedMeasure=0,lastCalibrationSave=0.0
@@ -557,6 +566,8 @@ final class ClosedCaseSession: NSObject {
     private var resumeAfterDrop=false
     var speed=1.0,clickSound=true
     var dragLockOn:Bool{get{dragLock.enabled}set{dragLock.enabled=newValue}}
+    var backTapOn=true,twistScrollOn=true
+    var scrollReverse:Bool{get{twistScroll.reverse}set{twistScroll.reverse=newValue}}
     var pointsWhenReady=false,usesNotch=false
     var centersItself:Bool{pointsWhenReady && centerOnly}
     var preparingConnection:Bool{preparing && lidWatcher==nil}
@@ -611,7 +622,7 @@ final class ClosedCaseSession: NSObject {
     func recenter(){if calibrated && inputReady{let resume=enabled;setPose();if resume{toggleCursor()}}else{changed()}}
     func recalibrate(){pause();hasPointed=false;calibrated=false;motion?.resetGrip();changed()}
     // Every way the pointer stops comes through here, so a held drag is always let go.
-    func pause(_ reason:String="Paused"){releaseDrag();pauseReason=reason;enabled=false;resumeAfterDrop=false;changed()}
+    func pause(_ reason:String="Paused"){releaseDrag();for event in twistScroll.reset(){noteScroll(event,at:0)};pauseReason=reason;enabled=false;resumeAfterDrop=false;changed()}
     func disconnect(then done:(()->Void)?=nil){
         if let done{if isActive{afterEnd.append(done)}else{done();return}}
         userEnded=true;stop()
@@ -781,6 +792,7 @@ final class ClosedCaseSession: NSObject {
         if now-lastStatus>0.2{lastStatus=now;readStatus()}
         if !stopping && helper?.isRunning == true{readMotion()}
         if enabled{perform(dragLock.tick(now:now))}
+        postScroll(now)
         if enabled && closedCaseShouldPause(motionAge:now-lastHost){
             pause("Lost the case’s motion. Pointing resumes when it’s back.");resumeAfterDrop=true
         }
@@ -837,6 +849,8 @@ final class ClosedCaseSession: NSObject {
             guard !rows.isEmpty else{return}
             defer{noteRead(from:readAt)}
             let tapEvents=tapLearner==nil && enabled && calibrated ? tapDetector.feed(rows):tapDetector.reset()
+            let backEvents=tapLearner==nil && tapTest==nil && enabled && calibrated && backTapOn ? backTapDetector.feed(rows):backTapDetector.reset()
+            backTapDetector.ignored=[]
             for event in tapLearner?.feed(rows) ?? []{
                 if case .tap=event,clickSound{TapClickSound.shared.play()}
                 try? log?.write(contentsOf:Data("TAPLEARN \(event)\n".utf8))
@@ -846,18 +860,25 @@ final class ClosedCaseSession: NSObject {
             for note in tapDetector.ignored{try? log?.write(contentsOf:Data("tap: \(note)\n".utf8));tapTest?(.rejected(note))}
             tapDetector.ignored=[]
             // Ahead of the orientation code, which can take tens of milliseconds now and then.
-            for event in tapEvents{
+            // Releases first, then taps in the order they began; each detector lets go only of its own hold.
+            func began(_ event:ClosedCaseTapDetector.Event)->Double{if case .tap(let since,_,_)=event{return since};return -.infinity}
+            for (event,back) in (tapEvents.map{($0,false)}+backEvents.map{($0,true)}).sorted(by:{began($0.0)<began($1.0)}){
                 switch event {
-                case .release:tapHold=nil
+                case .release:if heldByBack==back{tapHold=nil}
                 case .tap(let since,let jolt,let repeated):
-                    let at=recentPoints.last{$0.t<since}?.point ?? smooth;tapHold=at
+                    if let last=lastAcceptedTap,last.back != back,since-last.t<Self.echoGap{
+                        try? log?.write(contentsOf:Data(String(format:"tap: ignored %@ tap at %.2f, the case rocking back after the %@ tap\n",back ? "back":"front",since,last.back ? "back":"front").utf8))
+                        continue
+                    }
+                    lastAcceptedTap=(since,back)
+                    let at=recentPoints.last{$0.t<since}?.point ?? smooth;tapHold=at;heldByBack=back
                     if enabled{
                         let decided=ProcessInfo.processInfo.systemUptime
-                        if let tapTest{tapTest(.click)}else{handleTap(at)}
+                        if let tapTest{tapTest(.click)}else if back{rightClick(at)}else{handleTap(at)}
                         let clicked=ProcessInfo.processInfo.systemUptime
                         if clickSound{TapClickSound.shared.play()}
                         let sounded=ProcessInfo.processInfo.systemUptime
-                        try? log?.write(contentsOf:Data(String(format:"tap: click at %.2f, jolt %.2f g, %.0f ms after it began%@, %.0f ms after arrival, %.1f ms reading, %.1f ms posting, %.1f ms sound\n",since,jolt,1e3*((rows.last?[2] ?? 0)*1e-6-since),repeated ? ", repeat":"",1e3*(decided-(rows.last?[3] ?? decided)),1e3*(decided-readAt),1e3*(clicked-decided),1e3*(sounded-clicked)).utf8))
+                        try? log?.write(contentsOf:Data(String(format:"tap: %@click at %.2f, jolt %.2f g, %.0f ms after it began%@, %.0f ms after arrival, %.1f ms reading, %.1f ms posting, %.1f ms sound\n",back ? "right-":"",since,jolt,1e3*((rows.last?[2] ?? 0)*1e-6-since),repeated ? ", repeat":"",1e3*(decided-(rows.last?[3] ?? decided)),1e3*(decided-readAt),1e3*(clicked-decided),1e3*(sounded-clicked)).utf8))
                     }
                 }
             }
@@ -899,7 +920,11 @@ final class ClosedCaseSession: NSObject {
             }
             guard calibrated,let point=result["point"] as? [Double],point.count==2,point.allSatisfy(\.isFinite) else{return}
             let x=0.5+(point[0]-0.5)*speed,y=0.5+(point[1]-0.5)*speed
-            if let tapHold{smooth=tapHold}else{
+            if let twist=result["twist"] as? [Double],twist.count==4,twist.allSatisfy(\.isFinite){
+                let blocked = !enabled || !twistScrollOn || tapHold != nil || dragLock.dragging
+                for event in twistScroll.feed(t:stamp*1e-6,twist:twist[0],swing:SIMD3(twist[1],twist[2],twist[3]),blocked:blocked){noteScroll(event,at:stamp*1e-6)}
+            }
+            if let tapHold{smooth=tapHold}else if let scrollHold{smooth=scrollHold}else{
                 smooth=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
                 recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
             }
@@ -964,9 +989,37 @@ final class ClosedCaseSession: NSObject {
             }
         }
     }
-    private func postButton(_ type:CGEventType,at position:CGPoint,count:Int64){
-        guard let event=CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:position,mouseButton:.left) else{return}
+    private func postButton(_ type:CGEventType,at position:CGPoint,count:Int64,button:CGMouseButton = .left){
+        guard let event=CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:position,mouseButton:button) else{return}
         event.setIntegerValueField(.mouseEventClickState,value:count);event.post(tap:.cghidEventTap)
+    }
+    private func rightClick(_ point:CGPoint){
+        guard !dragLock.dragging else{try? log?.write(contentsOf:Data("tap: back tap ignored while dragging\n".utf8));return}
+        guard let bounds=pointerBounds() else{pause();return}
+        perform(dragLock.interrupt())
+        let position=screenPoint(point,bounds:bounds)
+        postButton(.rightMouseDown,at:position,count:1,button:.right);postButton(.rightMouseUp,at:position,count:1,button:.right)
+    }
+    // While a twist scrolls, the pointer stays where it was just before the twist began.
+    private func noteScroll(_ event:ClosedCaseTwistScroll.Event,at t:Double){
+        switch event {
+        case .started(let twist,let baseline,let twistIn,let aimIn):
+            scrollHold=recentPoints.last{$0.t<t-ClosedCaseTwistScroll.window}?.point ?? smooth;scrollCarry=0
+            try? log?.write(contentsOf:Data(String(format:"scroll: started at %.0f° twist, baseline %.0f°, %.0f° of twist and %.0f° of aim in %.1f s\n",twist,baseline,twistIn,aimIn,ClosedCaseTwistScroll.window).utf8))
+        case .ended:
+            scrollHold=nil;scrollCarry=0
+            try? log?.write(contentsOf:Data("scroll: ended\n".utf8))
+        case .ignored(let why):
+            try? log?.write(contentsOf:Data("scroll: ignored, \(why)\n".utf8))
+        }
+    }
+    private func postScroll(_ now:Double){
+        let dt=lastScrollTick>0 ? min(0.05,max(0,now-lastScrollTick)):0;lastScrollTick=now
+        guard enabled,twistScroll.scrolling,now-lastHost<0.25 else{scrollCarry=0;return}
+        scrollCarry+=twistScroll.rate*dt
+        let pixels=scrollCarry.rounded(.towardZero)
+        guard abs(pixels)>=1,let event=CGEvent(scrollWheelEvent2Source:nil,units:.pixel,wheelCount:1,wheel1:Int32(pixels),wheel2:0,wheel3:0) else{return}
+        scrollCarry-=pixels;event.post(tap:.cghidEventTap)
     }
     // Lets go of a held drag where the cursor is now, so the button is never left down.
     private func releaseDrag(){
